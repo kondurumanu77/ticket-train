@@ -9,16 +9,25 @@ on:
 
 jobs:
   build-deploy:
+
     runs-on: ubuntu-latest
 
     env:
       ECR_REPOSITORY: nani/paradise
+      IMAGE_TAG: ${{ github.sha }}
 
     steps:
 
+    # ---------------------------------------------------
+    # 1. Checkout Source Code
+    # ---------------------------------------------------
     - name: Checkout Source
       uses: actions/checkout@v4
 
+
+    # ---------------------------------------------------
+    # 2. Setup Java 17
+    # ---------------------------------------------------
     - name: Setup Java
       uses: actions/setup-java@v4
       with:
@@ -26,9 +35,21 @@ jobs:
         java-version: '17'
         cache: maven
 
-    - name: Build WAR
-      run: mvn clean package -DskipTests
 
+    # ---------------------------------------------------
+    # 3. Build WAR File
+    # ---------------------------------------------------
+    - name: Build WAR
+      run: |
+        mvn clean package -DskipTests
+
+        echo "Generated WAR files:"
+        ls -lh target/
+
+
+    # ---------------------------------------------------
+    # 4. Configure AWS Credentials
+    # ---------------------------------------------------
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -36,20 +57,86 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
+
+    # ---------------------------------------------------
+    # 5. Get AWS Account ID
+    # ---------------------------------------------------
+    - name: Get AWS Account ID
+      run: |
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
+
+        echo "AWS Account ID retrieved successfully"
+
+
+    # ---------------------------------------------------
+    # 6. Login to Amazon ECR
+    # ---------------------------------------------------
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
+
+    # ---------------------------------------------------
+    # 7. Build Docker Image
+    # ---------------------------------------------------
     - name: Build Docker Image
       run: |
-        docker build -t $ECR_REPOSITORY:latest .
+        docker build \
+          -t $ECR_REPOSITORY:$IMAGE_TAG \
+          .
 
+        echo "Docker image built successfully"
+
+
+    # ---------------------------------------------------
+    # 8. Tag Docker Image
+    # ---------------------------------------------------
     - name: Tag Docker Image
       run: |
-        docker tag $ECR_REPOSITORY:latest \
-          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/$ECR_REPOSITORY:latest
+        docker tag \
+          $ECR_REPOSITORY:$IMAGE_TAG \
+          $ACCOUNT_ID.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
 
+        echo "Docker image tagged successfully"
+
+
+    # ---------------------------------------------------
+    # 9. Push Docker Image to ECR
+    # ---------------------------------------------------
     - name: Push Docker Image
       run: |
         docker push \
-          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/$ECR_REPOSITORY:latest
+          $ACCOUNT_ID.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
+
+        echo "Docker image pushed to ECR successfully"
+
+
+    # ---------------------------------------------------
+    # 10. Update ECS Task Definition
+    # ---------------------------------------------------
+    - name: Update ECS Task Definition
+      run: |
+        IMAGE_URI="$ACCOUNT_ID.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG"
+
+        echo "Using image:"
+        echo "$IMAGE_URI"
+
+        sed -i "s|<IMAGE>|$IMAGE_URI|g" task-definition.json
+
+        echo "Updated task definition:"
+        cat task-definition.json
+
+        cp task-definition.json new-task.json
+
+
+    # ---------------------------------------------------
+    # 11. Deploy to Amazon ECS
+    # ---------------------------------------------------
+    - name: Deploy to Amazon ECS
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: new-task.json
+        service: ${{ secrets.ECS_SERVICE }}
+        cluster: ${{ secrets.ECS_CLUSTER }}
+        wait-for-service-stability: true
